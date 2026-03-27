@@ -1,7 +1,7 @@
 """Pydantic models for data validation and serialization."""
 
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 
 class SummaryModel(BaseModel):
@@ -46,3 +46,19 @@ class DiagnosticResults(BaseModel):
     alignment_score: float = Field(0.0, description="Alignment score 0.0-1.0 based on symptom match")
     confidence_level: str = Field("low", description="Confidence: low, moderate, or high")
     recommendation: str = Field("", description="Recommended next steps and clinical notes")
+
+
+class DiagnosticResultStructured(BaseModel):
+    """Structured diagnostic result formatted for API response (matches DB schema fields)."""
+    disorder_name: str = Field("", description="Specific disorder name")
+    category: Optional[str] = Field(None, description="Disorder category")
+    matched_criteria: Optional[int] = Field(None, description="Number of criteria met")
+    total_required: Optional[int] = Field(None, description="Total criteria required")
+    alignment_score: Optional[float] = Field(None, description="Alignment score 0.0-1.0")
+    confidence_level: Optional[str] = Field(None, description="Confidence level: low, moderate, or high")
+    duration_met: Optional[bool] = Field(None, description="Whether duration requirements are met")
+    impairment_met: Optional[bool] = Field(None, description="Whether functional impairment criteria are met")
+    exclusion_triggered: Optional[bool] = Field(None, description="Whether exclusion criteria are triggered")
+    recommendation: Optional[str] = Field(None, description="Recommended next steps and clinical notes")
+    conversation_summary: Optional[str] = Field(None, description="Conversation summary from session")
+    overview: Optional[str] = Field(None, description="Clinical overview")

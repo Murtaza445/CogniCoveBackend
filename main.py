@@ -10,7 +10,7 @@ from datetime import datetime
 from pydantic import ValidationError
 
 from chains import get_therapy_chain, get_summary_chain, get_classification_chain, get_diagnosis_chain
-from models import SummaryModel, ClassificationModel, DiagnosticResults
+from models import SummaryModel, ClassificationModel, DiagnosticResults, DiagnosticResultStructured
 from vectorstore import get_vectorstore
 from constants import DISORDER_CATEGORIES, APP_TITLE, APP_PAGE_TITLE
 from hybrid_retrieval import hybrid_classify, hybrid_diagnose
@@ -116,10 +116,70 @@ class DiagnoseRequest(BaseModel):
     classification: str
 
 
+class SymptomRecord(BaseModel):
+    """Symptom record for database population."""
+    disorder_category: Optional[str] = None
+    symptom_name: str
+    severity: Optional[str] = None  # 'mild', 'moderate', 'severe'
+    duration_days: Optional[int] = None
+    frequency: Optional[str] = None  # 'daily', 'weekly', 'occasional'
+
+
+class ImpairmentRecord(BaseModel):
+    """Impairment record for database population."""
+    disorder_category: Optional[str] = None
+    impairment_area: str  # 'work', 'social', 'academic', 'self_care', 'family'
+    severity_level: Optional[str] = None  # 'mild', 'moderate', 'severe'
+    description: Optional[str] = None
+
+
+class PatternAlignment(BaseModel):
+    """Pattern alignment for diagnostic confirmation."""
+    diagnostic_disorder_name: str
+    pattern_name: str
+    alignment_percentage: float
+    supporting_evidence: List[str] = Field(default_factory=list)
+    contradicting_evidence: List[str] = Field(default_factory=list)
+    clinical_notes: Optional[str] = None
+
+
+class ComorbidDiagnosis(BaseModel):
+    """Comorbid diagnosis relationship."""
+    primary_disorder_name: str
+    comorbid_disorder_name: str
+    relationship_strength: Optional[float] = None  # 0.0-1.0
+
+
+class MentalStateTracking(BaseModel):
+    """Daily mental state tracking aggregate."""
+    tracking_date: str
+    average_mood_score: Optional[float] = None  # 0-10
+    average_risk_level: Optional[str] = None  # 'low', 'moderate', 'high'
+    total_sessions_today: int = 0
+    crisis_count: int = 0
+    predominant_emotion: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class EnhancedDiagnoseResponse(BaseModel):
+    """Enhanced diagnostic response with database-ready structured data."""
+    session_id: str
+    diagnostic_results: List[DiagnosticResultStructured]
+    symptoms: List[SymptomRecord] = Field(default_factory=list)
+    impairment_records: List[ImpairmentRecord] = Field(default_factory=list)
+    pattern_alignment_summary: List[PatternAlignment] = Field(default_factory=list)
+    comorbid_diagnoses: List[ComorbidDiagnosis] = Field(default_factory=list)
+    mental_state_tracking: Optional[MentalStateTracking] = None
+    session_summary: Optional[str] = None
+    overall_mood_score: Optional[float] = None
+    overall_risk_level: Optional[str] = None
+    timestamp: str
+
+
 class DiagnoseResponse(BaseModel):
     """Response with diagnostic results."""
     session_id: str
-    diagnostic_results: List[str]
+    diagnostic_results: List[DiagnosticResultStructured]
     timestamp: str
 
 
@@ -133,7 +193,9 @@ class SessionEndResponse(BaseModel):
     session_id: str
     summary: Optional[str] = None
     classification: Optional[str] = None
-    diagnostic_results: Optional[List[str]] = None
+    diagnostic_results: Optional[List[DiagnosticResultStructured]] = None
+    symptoms: List[SymptomRecord] = Field(default_factory=list)
+    impairment_records: List[ImpairmentRecord] = Field(default_factory=list)
     ended_at: str
 
 
@@ -188,6 +250,197 @@ def parse_json_response(text: str) -> Optional[dict]:
                 return None
     return None
 
+def extract_symptoms_from_summary(summary_json: str, category: Optional[str] = None) -> List[SymptomRecord]:
+    """Extract structured symptom records from clinical summary."""
+    symptoms = []
+    try:
+        data = json.loads(summary_json)
+        symptom_list = data.get("symptom_list", [])
+        duration = data.get("duration_requirements", "")
+        
+        # Parse duration to days (rough estimate)
+        duration_days = None
+        if duration:
+            weeks = re.findall(r'(\d+)\s*weeks?', duration.lower())
+            days = re.findall(r'(\d+)\s*days?', duration.lower())
+            if weeks:
+                duration_days = int(weeks[0]) * 7
+            elif days:
+                duration_days = int(days[0])
+        
+        for symptom_name in symptom_list:
+            if isinstance(symptom_name, str):
+                symptoms.append(SymptomRecord(
+                    disorder_category=category,
+                    symptom_name=symptom_name.strip(),
+                    severity="moderate",  # Default, could be enhanced by NLP
+                    duration_days=duration_days,
+                    frequency="ongoing"
+                ))
+    except Exception:
+        pass
+    
+    return symptoms
+
+
+def extract_impairment_from_summary(summary_json: str, category: Optional[str] = None) -> List[ImpairmentRecord]:
+    """Extract structured impairment records from clinical summary."""
+    impairments = []
+    try:
+        data = json.loads(summary_json)
+        impairment_desc = data.get("impairment_requirement", "")
+        overview = data.get("overview", "")
+        
+        # Map keywords to impairment areas
+        impairment_keywords = {
+            "work": ["work", "job", "workplace", "productivity", "employment"],
+            "social": ["social", "relationships", "friends", "family interaction", "isolation"],
+            "academic": ["school", "academic", "study", "grades", "learning"],
+            "self_care": ["hygiene", "self-care", "grooming", "sleep", "eating"],
+            "family": ["family", "parent", "spouse", "child"]
+        }
+        
+        combined_text = (impairment_desc + " " + overview).lower()
+        
+        for area, keywords in impairment_keywords.items():
+            if any(k in combined_text for k in keywords):
+                impairments.append(ImpairmentRecord(
+                    disorder_category=category,
+                    impairment_area=area,
+                    severity_level="moderate",
+                    description=impairment_desc if area == "work" else overview
+                ))
+    except Exception:
+        pass
+    
+    return impairments
+
+
+def build_pattern_alignment(diagnostic_results_str: str, disorder_name: str) -> List[PatternAlignment]:
+    """Build pattern alignment records from diagnostic results."""
+    alignments = []
+    try:
+        data = json.loads(diagnostic_results_str)
+        alignment_patterns = [
+            {
+                "pattern_name": "Symptom Matching",
+                "evidence_field": "matched_criteria"
+            },
+            {
+                "pattern_name": "Duration Criteria",
+                "evidence_field": "duration_met"
+            },
+            {
+                "pattern_name": "Functional Impairment",
+                "evidence_field": "impairment_met"
+            }
+        ]
+        
+        for pattern in alignment_patterns:
+            value = data.get(pattern["evidence_field"])
+            if isinstance(value, bool):
+                alignment_pct = 100.0 if value else 0.0
+            elif isinstance(value, (int, float)):
+                alignment_pct = min(100.0, float(value))
+            else:
+                alignment_pct = 50.0
+            
+            alignments.append(PatternAlignment(
+                diagnostic_disorder_name=disorder_name,
+                pattern_name=pattern["pattern_name"],
+                alignment_percentage=alignment_pct,
+                supporting_evidence=[data.get("recommendation", "")],
+                contradicting_evidence=[data.get("recommendation", "")] if data.get("exclusion_triggered") else [],
+                clinical_notes=data.get("recommendation")
+            ))
+    except Exception:
+        pass
+    
+    return alignments
+
+
+def build_comorbid_relationships(classification_json: str, primary_disorder: str) -> List[ComorbidDiagnosis]:
+    """Build comorbid diagnosis relationships from classification."""
+    relationships = []
+    try:
+        data = json.loads(classification_json)
+        comorbid_cats = data.get("comorbid_categories", [])
+        comorbid_scores = data.get("comorbidity_scores", {})
+        
+        for comorbid_cat in comorbid_cats:
+            score = float(comorbid_scores.get(comorbid_cat, 0.5))
+            relationships.append(ComorbidDiagnosis(
+                primary_disorder_name=primary_disorder,
+                comorbid_disorder_name=comorbid_cat,
+                relationship_strength=score
+            ))
+    except Exception:
+        pass
+    
+    return relationships
+
+
+def compute_mental_state_tracking(session_data: dict) -> Optional[MentalStateTracking]:
+    """Compute daily mental state tracking from session data."""
+    try:
+        messages = session_data.get("messages", [])
+        total_sessions = len([m for m in messages if m.get("role") == "user"])
+        
+        # Count crisis indicators
+        crisis_count = 0
+        predominant_emotions = []
+        negative_emotion_keywords = ["suicide", "harm", "crisis", "emergency", "danger"]
+        
+        for msg in messages:
+            content = msg.get("content", "").lower()
+            if any(keyword in content for keyword in negative_emotion_keywords):
+                crisis_count += 1
+            
+            # Extract emotions (simplified)
+            emotion_keywords = ["sad", "anxious", "angry", "hopeless", "stressed", "overwhelmed"]
+            for emotion in emotion_keywords:
+                if emotion in content:
+                    predominant_emotions.append(emotion)
+        
+        predominant = predominant_emotions[0] if predominant_emotions else "neutral"
+        
+        return MentalStateTracking(
+            tracking_date=datetime.utcnow().isoformat(),
+            average_mood_score=5.0,  # Default neutral
+            average_risk_level="low" if crisis_count == 0 else ("high" if crisis_count > 2 else "moderate"),
+            total_sessions_today=total_sessions,
+            crisis_count=crisis_count,
+            predominant_emotion=predominant,
+            notes=f"Session analysis completed with {total_sessions} interactions"
+        )
+    except Exception:
+        return None
+
+
+def convert_diagnostic_to_structured(
+    diagnostic_json_str: str, 
+    conversation_summary: Optional[str] = None,
+    overview: Optional[str] = None
+) -> Optional[DiagnosticResultStructured]:
+    """Convert a diagnostic result JSON string to DiagnosticResultStructured."""
+    try:
+        data = json.loads(diagnostic_json_str)
+        return DiagnosticResultStructured(
+            disorder_name=data.get("disorder_name", ""),
+            category=data.get("category"),
+            matched_criteria=data.get("matched_criteria"),
+            total_required=data.get("total_required"),
+            alignment_score=data.get("alignment_score"),
+            confidence_level=data.get("confidence_level"),
+            duration_met=data.get("duration_met"),
+            impairment_met=data.get("impairment_met"),
+            exclusion_triggered=data.get("exclusion_triggered"),
+            recommendation=data.get("recommendation"),
+            conversation_summary=conversation_summary,
+            overview=overview
+        )
+    except Exception:
+        return None
 
 # ==================== API Endpoints ====================
 
@@ -390,11 +643,28 @@ async def generate_diagnosis(request: DiagnoseRequest):
     
     session = sessions_store[request.session_id]
     
+    # Extract conversation summary and overview for context
+    conversation_summary = None
+    overview = None
+    try:
+        summary_data = json.loads(request.summary)
+        conversation_summary = summary_data.get("conversation_summary")
+        overview = summary_data.get("overview")
+    except:
+        pass
+    
     # Skip if already diagnosed
     if session.get("diagnostic_results") is not None:
+        diagnostic_structured = []
+        for result_str in session["diagnostic_results"]:
+            if isinstance(result_str, str):
+                structured = convert_diagnostic_to_structured(result_str, conversation_summary, overview)
+                if structured:
+                    diagnostic_structured.append(structured)
+        
         return DiagnoseResponse(
             session_id=request.session_id,
-            diagnostic_results=session["diagnostic_results"],
+            diagnostic_results=diagnostic_structured,
             timestamp=datetime.utcnow().isoformat()
         )
     
@@ -409,20 +679,120 @@ async def generate_diagnosis(request: DiagnoseRequest):
         
         if cls_validated:
             results = hybrid_diagnose(request.summary, cls_validated)
-            diagnostic_results = results if results else []
+            diagnostic_results_raw = results if results else []
         else:
-            diagnostic_results = []
+            diagnostic_results_raw = []
         
-        session["diagnostic_results"] = diagnostic_results
+        # Convert to structured format
+        diagnostic_structured = []
+        for result_str in diagnostic_results_raw:
+            structured = convert_diagnostic_to_structured(result_str, conversation_summary, overview)
+            if structured:
+                diagnostic_structured.append(structured)
+        
+        session["diagnostic_results"] = diagnostic_results_raw  # Store raw for caching
         
         return DiagnoseResponse(
             session_id=request.session_id,
-            diagnostic_results=diagnostic_results,
+            diagnostic_results=diagnostic_structured,
             timestamp=datetime.utcnow().isoformat()
         )
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating diagnosis: {str(e)}")
+
+
+@app.post("/api/diagnose/enhanced", response_model=EnhancedDiagnoseResponse)
+async def generate_diagnosis_enhanced(request: DiagnoseRequest):
+    """Generate enhanced diagnostic results with structured database-ready data."""
+    if request.session_id not in sessions_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = sessions_store[request.session_id]
+    
+    try:
+        # Parse classification
+        cls_validated = None
+        cls_json = request.classification
+        try:
+            cls_data = json.loads(cls_json)
+            cls_validated = ClassificationModel(**cls_data)
+        except Exception:
+            pass
+        
+        # Generate diagnostic results
+        if cls_validated:
+            diagnostic_results = hybrid_diagnose(request.summary, cls_validated)
+        else:
+            diagnostic_results = []
+        
+        # Extract primary disorder from classification
+        primary_disorder = "Unknown"
+        try:
+            cls_data = json.loads(cls_json)
+            primary_disorder = cls_data.get("predicted_category", "Unknown")
+        except:
+            pass
+        
+        # Extract structured data for database
+        all_symptoms: List[SymptomRecord] = extract_symptoms_from_summary(request.summary, primary_disorder)
+        all_impairments: List[ImpairmentRecord] = extract_impairment_from_summary(request.summary, primary_disorder)
+        
+        all_patterns: List[PatternAlignment] = []
+        
+        # Extract conversation summary and overview for context
+        conversation_summary = None
+        overview = None
+        try:
+            summary_data = json.loads(request.summary)
+            conversation_summary = summary_data.get("conversation_summary")
+            overview = summary_data.get("overview")
+        except:
+            pass
+        
+        # Convert diagnostic results to structured format
+        diagnostic_structured = []
+        for diag_result_str in diagnostic_results:
+            try:
+                diag_data = json.loads(diag_result_str)
+                disorder_name = diag_data.get("disorder_name", "Unknown")
+                patterns = build_pattern_alignment(diag_result_str, disorder_name)
+                all_patterns.extend(patterns)
+                
+                # Convert to structured format
+                structured = convert_diagnostic_to_structured(diag_result_str, conversation_summary, overview)
+                if structured:
+                    diagnostic_structured.append(structured)
+            except:
+                pass
+        
+        # Build comorbid relationships
+        comorbid_rels: List[ComorbidDiagnosis] = build_comorbid_relationships(cls_json, primary_disorder)
+        
+        # Compute mental state tracking
+        mental_tracking = compute_mental_state_tracking(session)
+        
+        # Extract session-level summary fields
+        session_summary = conversation_summary
+        overall_mood_score = mental_tracking.average_mood_score if mental_tracking else None
+        overall_risk_level = mental_tracking.average_risk_level if mental_tracking else None
+        
+        return EnhancedDiagnoseResponse(
+            session_id=request.session_id,
+            diagnostic_results=diagnostic_structured,
+            symptoms=all_symptoms,
+            impairment_records=all_impairments,
+            pattern_alignment_summary=all_patterns,
+            comorbid_diagnoses=comorbid_rels,
+            mental_state_tracking=mental_tracking,
+            session_summary=session_summary,
+            overall_mood_score=overall_mood_score,
+            overall_risk_level=overall_risk_level,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating enhanced diagnosis: {str(e)}")
 
 
 @app.post("/api/sessions/{session_id}/end", response_model=SessionEndResponse)
@@ -434,11 +804,44 @@ async def end_session(session_id: str):
     session = sessions_store[session_id]
     session["session_ended"] = True
     
+    # Extract conversation summary and overview for context
+    conversation_summary = None
+    overview = None
+    try:
+        summary_data = json.loads(session.get("summary", "{}"))
+        conversation_summary = summary_data.get("conversation_summary")
+        overview = summary_data.get("overview")
+    except:
+        pass
+    
+    # Extract primary disorder from classification
+    primary_disorder = "Unknown"
+    try:
+        cls_data = json.loads(session.get("classification", "{}"))
+        primary_disorder = cls_data.get("predicted_category", "Unknown")
+    except:
+        pass
+    
+    # Convert diagnostic results to structured format
+    diagnostic_structured = []
+    if session.get("diagnostic_results"):
+        for result_str in session["diagnostic_results"]:
+            if isinstance(result_str, str):
+                structured = convert_diagnostic_to_structured(result_str, conversation_summary, overview)
+                if structured:
+                    diagnostic_structured.append(structured)
+    
+    # Extract symptoms and impairments
+    all_symptoms = extract_symptoms_from_summary(session.get("summary", "{}"), primary_disorder)
+    all_impairments = extract_impairment_from_summary(session.get("summary", "{}"), primary_disorder)
+    
     return SessionEndResponse(
         session_id=session_id,
         summary=session.get("summary"),
         classification=session.get("classification"),
-        diagnostic_results=session.get("diagnostic_results"),
+        diagnostic_results=diagnostic_structured if diagnostic_structured else None,
+        symptoms=all_symptoms,
+        impairment_records=all_impairments,
         ended_at=datetime.utcnow().isoformat()
     )
 
@@ -470,6 +873,7 @@ async def root():
             "summary": "POST /api/summary",
             "classify": "POST /api/classify",
             "diagnose": "POST /api/diagnose",
+            "diagnose_enhanced": "POST /api/diagnose/enhanced (returns database-ready structured data)",
             "end_session": "POST /api/sessions/{session_id}/end",
             "delete_session": "DELETE /api/sessions/{session_id}",
             "docs": "/docs",
