@@ -1,0 +1,41 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments (DO NOT COMMIT) ---
+venv/
+.venv/
+ENV/
+env/
+
+# --- Local IDE/editor settings ---
+.vscode/
+.idea/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Jupyter / misc ---
+.ipynb_checkpoints/
+
+# --- Streamlit UI (not used for FastAPI) ---
+ui.py
+frontfyp.py
+
+# --- Unused scripts ---
+fix_imports.py
+build_disorder_vectorstores.py
+.venv-packages.txt
