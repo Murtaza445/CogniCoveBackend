@@ -1,5 +1,6 @@
 """Constants and configuration for CogniCove Therapy Assistant."""
 
+import os
 from dotenv import load_dotenv
 
 # Load API keys
@@ -19,6 +20,10 @@ DISORDER_CATEGORIES = [
 
 # LLM Configuration
 LLM_MODEL_NAME = "openai/gpt-oss-120b"
+THERAPY_MODEL_NAME = os.getenv("THERAPY_MODEL_NAME", "llama-3.3-70b-versatile")
+CATEGORY_CLASSIFICATION_MODEL_NAME = os.getenv("CATEGORY_CLASSIFICATION_MODEL_NAME", "openai/gpt-oss-20b")
+DISORDER_DIAGNOSIS_MODEL_NAME = os.getenv("DISORDER_DIAGNOSIS_MODEL_NAME", "openai/gpt-oss-120b")
+CRISIS_DETECTION_LLM_MODEL_NAME = os.getenv("CRISIS_DETECTION_LLM_MODEL_NAME", "groq/compound")
 THERAPY_TEMPERATURE = 0.7
 DETERMINISTIC_TEMPERATURE = 0.0
 

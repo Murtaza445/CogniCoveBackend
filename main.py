@@ -1,11 +1,19 @@
 """FastAPI backend for Disorder Chat application."""
 
-from fastapi import FastAPI, HTTPException
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import json
 import re
+import base64
+import asyncio
 from datetime import datetime
 from pydantic import ValidationError
 
@@ -16,6 +24,10 @@ from constants import DISORDER_CATEGORIES, APP_TITLE, APP_PAGE_TITLE
 from hybrid_retrieval import hybrid_classify, hybrid_diagnose
 from knowledge_graph import build_knowledge_graph
 from langchain_core.messages import HumanMessage, AIMessage
+from realtime.ws_manager import WebSocketSessionManager
+from realtime.audio_pipeline import VoskStreamingSTT, PiperTTS
+from realtime.emotion_pipeline import analyze_speech
+from suicide_detection import get_suicide_detector
 
 
 # Initialize FastAPI app
@@ -35,6 +47,11 @@ sessions_store = {}
 
 # Initialize knowledge graph (cached)
 kg = build_knowledge_graph()
+
+# Initialize suicide detection system
+print("\n" + "="*80)
+suicide_detector = get_suicide_detector()
+print("="*80 + "\n")
 
 
 # ==================== Request/Response Models ====================
@@ -442,6 +459,14 @@ def convert_diagnostic_to_structured(
     except Exception:
         return None
 
+
+# Realtime websocket manager (separate from REST workflow)
+realtime_ws_manager = WebSocketSessionManager(
+    get_or_create_session=get_or_create_session,
+    build_chat_history_from_session=build_chat_history_from_session,
+    therapy_chain_factory=get_therapy_chain,
+)
+
 # ==================== API Endpoints ====================
 
 @app.get("/health")
@@ -462,7 +487,7 @@ async def create_session(request: SessionCreateRequest):
     )
 
 
-@app.post("/api/sessions/{session_id}", response_model=SessionData)
+@app.get("/api/sessions/{session_id}", response_model=SessionData)
 async def get_session(session_id: str):
     """Retrieve session data."""
     if session_id not in sessions_store:
@@ -492,7 +517,10 @@ async def get_session(session_id: str):
 
 @app.post("/api/therapy", response_model=TherapyResponse)
 async def therapy_message(request: MessageRequest):
-    """Process therapy message and generate response."""
+    """
+    Process therapy message and return response immediately.
+    Crisis detection runs in background without blocking therapy response.
+    """
     # Get or create session
     session = get_or_create_session(request.session_id)
     
@@ -505,18 +533,18 @@ async def therapy_message(request: MessageRequest):
     session["messages"].append(user_msg)
     
     try:
-        # Get therapy chain and build chat history
+        # ==================== THERAPY PIPELINE (FAST) ====================
+        # Generate therapy response immediately - this is the main pipeline
         therapy_chain = get_therapy_chain()
         chat_history = build_chat_history_from_session(request.session_id)
         
-        # Generate response
         response = therapy_chain.invoke({
             "chat_history": chat_history,
             "query": request.content
         })
         response_text = response.content
         
-        # Add assistant message
+        # Add assistant message to session
         assistant_msg = {
             "role": "assistant",
             "content": response_text,
@@ -524,6 +552,72 @@ async def therapy_message(request: MessageRequest):
         }
         session["messages"].append(assistant_msg)
         
+        # ==================== CRISIS DETECTION (BACKGROUND) ====================
+        # Run crisis detection in background without blocking therapy response
+        async def run_crisis_detection_background():
+            """Run crisis detection in background - fire and forget."""
+            try:
+                # Run ELECTRA detection
+                if suicide_detector.is_available():
+                    electra_result = suicide_detector.predict(request.content, session_id=request.session_id)
+                    suicide_detector.print_result(electra_result, session_id=request.session_id)
+                else:
+                    electra_result = None
+                
+                # Run LLM detection
+                try:
+                    llm_result = suicide_detector.predict_with_llm(request.content, session_id=request.session_id)
+                    suicide_detector.print_result(llm_result, session_id=request.session_id)
+                except Exception as e:
+                    print(f"⚠️  LLM detection error: {str(e)}")
+                    llm_result = None
+
+                # ==================== MODERATE TRACKING + FINAL RE-CHECK ====================
+                tracking_result = None
+                final_recheck_result = None
+                try:
+                    tracking_result = suicide_detector.update_moderate_tracking_and_maybe_recheck(
+                        session_id=request.session_id,
+                        text=request.content,
+                        electra_result=electra_result,
+                        llm_result=llm_result,
+                        timestamp=user_msg["timestamp"],
+                    )
+                    final_recheck_result = tracking_result.get("final_recheck") if tracking_result else None
+
+                    # Print tracking info (non-emergency)
+                    if tracking_result and tracking_result.get("alert_reason"):
+                        print(f"\n⚠️  {tracking_result['alert_reason']}")
+                        print(f"    Session ID: {request.session_id}")
+
+                    # Print final re-check result if it ran
+                    if final_recheck_result is not None:
+                        suicide_detector.print_result(final_recheck_result, session_id=request.session_id)
+                except Exception as e:
+                    print(f"⚠️  Moderate tracking error: {str(e)}")
+                    tracking_result = None
+                    final_recheck_result = None
+                
+                # Store detection results in session
+                if electra_result is not None or llm_result is not None:
+                    if 'suicide_detections' not in session:
+                        session['suicide_detections'] = []
+                    session['suicide_detections'].append({
+                        'timestamp': user_msg['timestamp'],
+                        'user_message': request.content,
+                        'electra_result': electra_result,
+                        'llm_result': llm_result,
+                        'moderate_tracking': tracking_result,
+                        'llm_final_recheck_result': final_recheck_result
+                    })
+            except Exception as e:
+                print(f"❌ Background crisis detection error: {str(e)}")
+        
+        # Start crisis detection as background task (fire and forget)
+        asyncio.create_task(run_crisis_detection_background())
+        
+        # ==================== RETURN THERAPY RESPONSE IMMEDIATELY ====================
+        # Therapy response is returned without waiting for crisis detection
         return TherapyResponse(
             session_id=request.session_id,
             user_message=request.content,
@@ -533,6 +627,196 @@ async def therapy_message(request: MessageRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating therapy response: {str(e)}")
+
+
+@app.post("/api/therapy/audio")
+async def therapy_audio(session_id: str, file: UploadFile = File(...)):
+    """
+    Process audio input and return audio response.
+    
+    Endpoint for Next.js frontend to send audio files.
+    
+    Request:
+    - session_id: Query parameter (session identifier)
+    - file: Audio file (binary, WAV format, 16-bit, 16kHz, mono)
+    
+    Response:
+    {
+      "session_id": "session_123",
+      "user_text": "What was transcribed from audio",
+      "ai_response": "Therapy response text",
+      "emotion": "emotion_label",
+      "audio_base64": "<base64-encoded WAV>",
+      "audio_type": "audio/wav",
+      "timestamp": "2024-04-12T..."
+    }
+    """
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    
+    try:
+        # Step 1: Read audio bytes from uploaded file
+        audio_bytes = await file.read()
+        
+        if not audio_bytes or len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+        
+        # Step 2: Get or create session
+        session = get_or_create_session(session_id)
+        
+        # ==================== STEP 3: STT ====================
+        stt = VoskStreamingSTT()
+        
+        if not stt.enabled:
+            raise HTTPException(status_code=503, detail="STT service not available. Vosk model not loaded.")
+        
+        # Decode audio to text using Vosk
+        user_text = await stt.process_audio_chunk(audio_bytes)
+        
+        if not user_text or user_text.strip() == "":
+            raise HTTPException(status_code=400, detail="❌ No speech detected. Please speak clearly and try again.")
+        
+        # ==================== STEP 4: ADD TO SESSION ====================
+        user_msg = {
+            "role": "user",
+            "content": user_text.strip(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        session["messages"].append(user_msg)
+        
+        # ==================== STEP 5: EMOTION + THERAPY (FAST PATH) ====================
+        # Generate emotion analysis and therapy response (core pipeline)
+        async def analyze_emotion_async():
+            """Run emotion analysis asynchronously."""
+            try:
+                emotion_result = await analyze_speech(audio_bytes)
+                return emotion_result.get("label", "neutral") if isinstance(emotion_result, dict) else "neutral"
+            except Exception as e:
+                print(f"Emotion analysis warning: {e}")
+                return "neutral"
+        
+        async def generate_therapy_async():
+            """Generate therapy response asynchronously."""
+            therapy_chain = get_therapy_chain()
+            chat_history = build_chat_history_from_session(session_id)
+            return therapy_chain.invoke({
+                "chat_history": chat_history,
+                "query": user_text.strip()
+            })
+        
+        # Execute emotion and therapy in parallel (these are fast)
+        emotion_label, llm_response = await asyncio.gather(
+            analyze_emotion_async(),
+            generate_therapy_async()
+        )
+        
+        # Get response text
+        response_text = llm_response.content
+        
+        # Add assistant message to session
+        assistant_msg = {
+            "role": "assistant",
+            "content": response_text,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        session["messages"].append(assistant_msg)
+        
+        # ==================== STEP 5B: CRISIS DETECTION (BACKGROUND) ====================
+        # Run crisis detection in background without blocking audio response
+        async def run_crisis_detection_background():
+            """Run crisis detection in background - fire and forget."""
+            try:
+                # Run ELECTRA detection
+                if suicide_detector.is_available():
+                    electra_result = suicide_detector.predict(user_text.strip(), session_id=session_id)
+                    suicide_detector.print_result(electra_result, session_id=session_id)
+                else:
+                    electra_result = None
+                
+                # Run LLM detection
+                try:
+                    llm_result = suicide_detector.predict_with_llm(user_text.strip(), session_id=session_id)
+                    suicide_detector.print_result(llm_result, session_id=session_id)
+                except Exception as e:
+                    print(f"⚠️  LLM detection error: {str(e)}")
+                    llm_result = None
+
+                # ==================== MODERATE TRACKING + FINAL RE-CHECK ====================
+                tracking_result = None
+                final_recheck_result = None
+                try:
+                    tracking_result = suicide_detector.update_moderate_tracking_and_maybe_recheck(
+                        session_id=session_id,
+                        text=user_text.strip(),
+                        electra_result=electra_result,
+                        llm_result=llm_result,
+                        timestamp=user_msg["timestamp"],
+                    )
+                    final_recheck_result = tracking_result.get("final_recheck") if tracking_result else None
+
+                    if tracking_result and tracking_result.get("alert_reason"):
+                        print(f"\n⚠️  {tracking_result['alert_reason']}")
+                        print(f"    Session ID: {session_id}")
+
+                    if final_recheck_result is not None:
+                        suicide_detector.print_result(final_recheck_result, session_id=session_id)
+                except Exception as e:
+                    print(f"⚠️  Moderate tracking error: {str(e)}")
+                    tracking_result = None
+                    final_recheck_result = None
+                
+                # Store detection results in session
+                if electra_result is not None or llm_result is not None:
+                    if 'suicide_detections' not in session:
+                        session['suicide_detections'] = []
+                    session['suicide_detections'].append({
+                        'timestamp': user_msg['timestamp'],
+                        'user_message': user_text.strip(),
+                        'electra_result': electra_result,
+                        'llm_result': llm_result,
+                        'moderate_tracking': tracking_result,
+                        'llm_final_recheck_result': final_recheck_result
+                    })
+            except Exception as e:
+                print(f"❌ Background crisis detection error: {str(e)}")
+        
+        # Start crisis detection as background task (fire and forget)
+        asyncio.create_task(run_crisis_detection_background())
+        
+        # ==================== STEP 6: TTS ====================
+        try:
+            tts = PiperTTS()
+            audio_response = await tts.text_to_audio_bytes(response_text)
+            
+            if not audio_response or len(audio_response) < 1000:
+                print(f"⚠️ TTS produced invalid audio: {len(audio_response) if audio_response else 0} bytes")
+                raise HTTPException(status_code=503, detail="TTS service returned invalid audio. Please try again.")
+            
+            # Encode response audio as base64 for JSON response
+            audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise
+            print(f"❌ TTS processing failed: {str(e)}")
+            raise HTTPException(status_code=503, detail=f"TTS service error: {str(e)}")
+        
+        # ==================== STEP 7: RETURN ====================
+        return {
+            "session_id": session_id,
+            "user_text": user_text.strip(),
+            "ai_response": response_text,
+            "emotion": emotion_label,
+            "audio_base64": audio_base64,
+            "audio_type": "audio/wav",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Audio therapy error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
 
 @app.post("/api/summary", response_model=SummaryResponse)
@@ -613,14 +897,21 @@ async def classify_disorder(request: ClassifyRequest):
         )
     
     try:
+        print(f"📋 CLASSIFY: Input summary type: {type(request.summary)}")
+        print(f"📋 CLASSIFY: Input summary length: {len(request.summary) if request.summary else 0}")
+        print(f"📋 CLASSIFY: Input summary (first 200 chars): {request.summary[:200] if request.summary else 'NONE'}")
+        
         cls_validated = hybrid_classify(request.summary)
+        print(f"✅ CLASSIFY: hybrid_classify returned: {type(cls_validated)}")
         
         if cls_validated:
             classification_json = cls_validated.model_dump_json(indent=2)
             comorbid_categories = cls_validated.comorbid_categories or []
+            print(f"✅ CLASSIFY: Classification complete - {len(comorbid_categories)} comorbid categories")
         else:
             classification_json = "Unable to classify."
             comorbid_categories = []
+            print("⚠️ CLASSIFY: hybrid_classify returned None")
         
         session["classification"] = classification_json
         
@@ -632,6 +923,9 @@ async def classify_disorder(request: ClassifyRequest):
         )
     
     except Exception as e:
+        import traceback
+        print(f"❌ CLASSIFY ERROR: {str(e)}")
+        print(f"❌ CLASSIFY TRACEBACK:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error classifying disorder: {str(e)}")
 
 
@@ -804,6 +1098,9 @@ async def end_session(session_id: str):
     session = sessions_store[session_id]
     session["session_ended"] = True
     
+    # Reset suicide detection tracking for this session
+    suicide_detector.reset_session(session_id)
+    
     # Extract conversation summary and overview for context
     conversation_summary = None
     overview = None
@@ -854,6 +1151,29 @@ async def delete_session(session_id: str):
     
     del sessions_store[session_id]
     return {"message": f"Session {session_id} deleted"}
+
+
+@app.websocket("/ws/video/{session_id}")
+async def video_audio_ws(websocket: WebSocket, session_id: str):
+    """Realtime websocket endpoint for chunked audio processing and AI response streaming."""
+    await realtime_ws_manager.connect(websocket, session_id)
+
+    try:
+        while True:
+            payload = await websocket.receive()
+
+            if payload.get("bytes") is not None:
+                await realtime_ws_manager.handle_audio_chunk(session_id, payload["bytes"])
+                continue
+
+            text_payload = payload.get("text")
+            if text_payload is not None:
+                await realtime_ws_manager.handle_text_message(session_id, text_payload)
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await realtime_ws_manager.disconnect_and_persist(session_id)
 
 
 # ==================== Root Endpoint ====================

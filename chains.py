@@ -2,13 +2,21 @@
 
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from constants import LLM_MODEL_NAME, THERAPY_TEMPERATURE, DETERMINISTIC_TEMPERATURE, DISORDER_CATEGORIES
+from constants import (
+    LLM_MODEL_NAME,
+    THERAPY_MODEL_NAME,
+    CATEGORY_CLASSIFICATION_MODEL_NAME,
+    DISORDER_DIAGNOSIS_MODEL_NAME,
+    THERAPY_TEMPERATURE,
+    DETERMINISTIC_TEMPERATURE,
+    DISORDER_CATEGORIES,
+)
 
 
 def get_therapy_chain():
     """Create a chain for therapeutic conversation."""
     therapy_chat = ChatGroq(
-        model_name=LLM_MODEL_NAME,
+        model_name=THERAPY_MODEL_NAME,
         temperature=THERAPY_TEMPERATURE
     )
 
@@ -78,7 +86,7 @@ Output rules:
 def get_classification_chain():
     """Create a chain for classifying disorder categories with comorbidity detection."""
     classifier = ChatGroq(
-        model_name=LLM_MODEL_NAME,
+        model_name=CATEGORY_CLASSIFICATION_MODEL_NAME,
         temperature=DETERMINISTIC_TEMPERATURE,
     )
 
@@ -129,7 +137,7 @@ Output rules:
 def get_diagnosis_chain():
     """Create a chain for generating structured diagnostic results."""
     diag_llm = ChatGroq(
-        model_name=LLM_MODEL_NAME,
+        model_name=DISORDER_DIAGNOSIS_MODEL_NAME,
         temperature=DETERMINISTIC_TEMPERATURE
     )
 
