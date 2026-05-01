@@ -28,6 +28,10 @@ from realtime.ws_manager import WebSocketSessionManager
 from realtime.audio_pipeline import VoskStreamingSTT, PiperTTS
 from realtime.emotion_pipeline import analyze_speech
 from suicide_detection import get_suicide_detector
+from deploy_validate import validate
+
+# Fail fast if model files are missing or are Git LFS pointers
+validate()
 
 
 # Initialize FastAPI app

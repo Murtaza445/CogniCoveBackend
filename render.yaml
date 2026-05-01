@@ -1,0 +1,23 @@
+# Render.com Blueprint
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: cognicove-api
+    runtime: docker
+    plan: standard          # Minimum realistic plan (4 GB RAM)
+    branch: main
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: VOSK_MODEL_PATH
+        value: /app/models/vosk-model
+      - key: PIPER_BIN
+        value: /opt/piper/piper
+      - key: PIPER_MODEL
+        value: /app/models/piper/en_US-lessac-medium.onnx
+      - key: VOSK_SAMPLE_RATE
+        value: "16000"
+      # 🔴 Add GROQ_API_KEY in the Render Dashboard (Environment tab) — do NOT commit secrets here.

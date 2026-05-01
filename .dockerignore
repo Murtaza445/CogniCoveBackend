@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Git
+.git/
+.gitattributes
+.gitignore
+
+# Local dev / notebooks (large, not needed at runtime)
+*.ipynb
+Crisis Detection Model/*.ipynb
+models/facial_emotion/facial_emotion_training_code.ipynb
+
+# Docs
+*.md
+!README.md
+
+# Audio outputs
+responsefinal.wav
+
+# Scripts (build helpers, not runtime)
+scripts/
+
+# Windows-specific Piper binaries (Linux build downloads its own)
+/piper/
