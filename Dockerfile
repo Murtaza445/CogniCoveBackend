@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
+    libgl1 \
     wget \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

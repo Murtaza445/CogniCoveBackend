@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -26,7 +26,7 @@ from knowledge_graph import build_knowledge_graph
 from langchain_core.messages import HumanMessage, AIMessage
 from realtime.ws_manager import WebSocketSessionManager
 from realtime.audio_pipeline import VoskStreamingSTT, PiperTTS
-from realtime.emotion_pipeline import analyze_speech
+from realtime.emotion_pipeline import analyze_speech, analyze_face
 from suicide_detection import get_suicide_detector
 from deploy_validate import validate
 
@@ -64,6 +64,7 @@ class MessageRequest(BaseModel):
     """Request model for therapy messages."""
     session_id: str
     content: str
+    facial_emotion: Optional[str] = None
 
 
 class TherapyResponse(BaseModel):
@@ -72,6 +73,7 @@ class TherapyResponse(BaseModel):
     user_message: str
     assistant_message: str
     timestamp: str
+    facial_emotion: Optional[str] = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -202,6 +204,23 @@ class DiagnoseResponse(BaseModel):
     session_id: str
     diagnostic_results: List[DiagnosticResultStructured]
     timestamp: str
+
+
+class TTSRequest(BaseModel):
+    """Request to synthesize speech."""
+    text: str
+
+
+class TTSResponse(BaseModel):
+    """Response with synthesized audio."""
+    audio_base64: str
+    audio_type: str
+
+
+class FaceEmotionResponse(BaseModel):
+    """Response with facial emotion analysis."""
+    emotion: str
+    confidence: float
 
 
 class SessionEndRequest(BaseModel):
@@ -542,9 +561,13 @@ async def therapy_message(request: MessageRequest):
         therapy_chain = get_therapy_chain()
         chat_history = build_chat_history_from_session(request.session_id)
         
+        query = request.content
+        if request.facial_emotion:
+            query = f"[Detected user emotion — facial expression: {request.facial_emotion}]\n{query}"
+
         response = therapy_chain.invoke({
             "chat_history": chat_history,
-            "query": request.content
+            "query": query
         })
         response_text = response.content
         
@@ -626,7 +649,8 @@ async def therapy_message(request: MessageRequest):
             session_id=request.session_id,
             user_message=request.content,
             assistant_message=response_text,
-            timestamp=assistant_msg["timestamp"]
+            timestamp=assistant_msg["timestamp"],
+            facial_emotion=request.facial_emotion
         )
     
     except Exception as e:
@@ -634,15 +658,22 @@ async def therapy_message(request: MessageRequest):
 
 
 @app.post("/api/therapy/audio")
-async def therapy_audio(session_id: str, file: UploadFile = File(...)):
+async def therapy_audio(
+    session_id: str,
+    file: UploadFile = File(...),
+    facial_emotion: Optional[str] = Form(None),
+    tts: bool = Form(True)
+):
     """
-    Process audio input and return audio response.
+    Process audio input and return therapy response.
     
     Endpoint for Next.js frontend to send audio files.
     
     Request:
     - session_id: Query parameter (session identifier)
     - file: Audio file (binary, WAV format, 16-bit, 16kHz, mono)
+    - facial_emotion: Optional aggregated facial emotion (form field)
+    - tts: Whether to synthesize audio response (default true for backward compat)
     
     Response:
     {
@@ -650,7 +681,7 @@ async def therapy_audio(session_id: str, file: UploadFile = File(...)):
       "user_text": "What was transcribed from audio",
       "ai_response": "Therapy response text",
       "emotion": "emotion_label",
-      "audio_base64": "<base64-encoded WAV>",
+      "audio_base64": "<base64-encoded WAV or null>",
       "audio_type": "audio/wav",
       "timestamp": "2024-04-12T..."
     }
@@ -704,16 +735,27 @@ async def therapy_audio(session_id: str, file: UploadFile = File(...)):
             """Generate therapy response asynchronously."""
             therapy_chain = get_therapy_chain()
             chat_history = build_chat_history_from_session(session_id)
+
+            # Build emotion-aware query
+            emotion_parts = []
+            if emotion_label and emotion_label != "neutral":
+                emotion_parts.append(f"speech tone: {emotion_label}")
+            if facial_emotion and facial_emotion != "neutral":
+                emotion_parts.append(f"facial expression: {facial_emotion}")
+
+            if emotion_parts:
+                augmented_query = f"[Detected user emotion — {', '.join(emotion_parts)}]\n{user_text.strip()}"
+            else:
+                augmented_query = user_text.strip()
+
             return therapy_chain.invoke({
                 "chat_history": chat_history,
-                "query": user_text.strip()
+                "query": augmented_query
             })
         
-        # Execute emotion and therapy in parallel (these are fast)
-        emotion_label, llm_response = await asyncio.gather(
-            analyze_emotion_async(),
-            generate_therapy_async()
-        )
+        # Run emotion analysis first, then therapy generation (therapy needs emotion context)
+        emotion_label = await analyze_emotion_async()
+        llm_response = await generate_therapy_async()
         
         # Get response text
         response_text = llm_response.content
@@ -788,22 +830,21 @@ async def therapy_audio(session_id: str, file: UploadFile = File(...)):
         # Start crisis detection as background task (fire and forget)
         asyncio.create_task(run_crisis_detection_background())
         
-        # ==================== STEP 6: TTS ====================
-        try:
-            tts = PiperTTS()
-            audio_response = await tts.text_to_audio_bytes(response_text)
-            
-            if not audio_response or len(audio_response) < 1000:
-                print(f"⚠️ TTS produced invalid audio: {len(audio_response) if audio_response else 0} bytes")
-                raise HTTPException(status_code=503, detail="TTS service returned invalid audio. Please try again.")
-            
-            # Encode response audio as base64 for JSON response
-            audio_base64 = base64.b64encode(audio_response).decode('utf-8')
-        except Exception as e:
-            if isinstance(e, HTTPException):
-                raise
-            print(f"❌ TTS processing failed: {str(e)}")
-            raise HTTPException(status_code=503, detail=f"TTS service error: {str(e)}")
+        # ==================== STEP 6: TTS (OPTIONAL) ====================
+        audio_base64 = None
+        if tts:
+            try:
+                tts_engine = PiperTTS()
+                audio_response = await tts_engine.text_to_audio_bytes(response_text)
+                
+                if not audio_response or len(audio_response) < 1000:
+                    print(f"⚠️ TTS produced invalid audio: {len(audio_response) if audio_response else 0} bytes")
+                else:
+                    # Encode response audio as base64 for JSON response
+                    audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+            except Exception as e:
+                print(f"⚠️ TTS processing failed: {str(e)}")
+                # Do NOT raise — text response is still valuable
         
         # ==================== STEP 7: RETURN ====================
         return {
@@ -812,7 +853,7 @@ async def therapy_audio(session_id: str, file: UploadFile = File(...)):
             "ai_response": response_text,
             "emotion": emotion_label,
             "audio_base64": audio_base64,
-            "audio_type": "audio/wav",
+            "audio_type": "audio/wav" if audio_base64 else None,
             "timestamp": datetime.utcnow().isoformat()
         }
     
@@ -1178,6 +1219,54 @@ async def video_audio_ws(websocket: WebSocket, session_id: str):
         pass
     finally:
         await realtime_ws_manager.disconnect_and_persist(session_id)
+
+
+@app.post("/api/emotion/face", response_model=FaceEmotionResponse)
+async def analyze_facial_emotion(file: UploadFile = File(...)):
+    """
+    Accept a webcam frame (JPEG/PNG) and return the detected facial emotion.
+    """
+    try:
+        frame_bytes = await file.read()
+        if not frame_bytes:
+            raise HTTPException(status_code=400, detail="Empty image file")
+
+        result = await analyze_face(frame_bytes)
+
+        return FaceEmotionResponse(
+            emotion=result.get("label", "neutral"),
+            confidence=result.get("confidence", 0.0)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Face emotion endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"Face analysis error: {str(e)}")
+
+
+@app.post("/api/tts", response_model=TTSResponse)
+async def text_to_speech(request: TTSRequest):
+    """
+    Synthesize speech from text on demand.
+    Used by the frontend play button on every AI message.
+    """
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    try:
+        tts_engine = PiperTTS()
+        audio_bytes = await tts_engine.text_to_audio_bytes(request.text.strip())
+
+        if not audio_bytes or len(audio_bytes) < 1000:
+            raise HTTPException(status_code=503, detail="TTS produced invalid audio")
+
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return TTSResponse(audio_base64=audio_base64, audio_type="audio/wav")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ TTS endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
 
 
 # ==================== Root Endpoint ====================
