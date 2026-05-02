@@ -28,6 +28,7 @@ from realtime.ws_manager import WebSocketSessionManager
 from realtime.audio_pipeline import VoskStreamingSTT, PiperTTS
 from realtime.emotion_pipeline import analyze_speech, analyze_face
 from suicide_detection import get_suicide_detector
+from email_service import send_crisis_alert_email
 from deploy_validate import validate
 
 # Fail fast if model files are missing or are Git LFS pointers
@@ -65,6 +66,7 @@ class MessageRequest(BaseModel):
     session_id: str
     content: str
     facial_emotion: Optional[str] = None
+    user_email: Optional[str] = None
 
 
 class TherapyResponse(BaseModel):
@@ -74,6 +76,9 @@ class TherapyResponse(BaseModel):
     assistant_message: str
     timestamp: str
     facial_emotion: Optional[str] = None
+    crisis_alert: bool = False
+    crisis_probability: Optional[float] = None
+    crisis_reason: Optional[str] = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -579,18 +584,41 @@ async def therapy_message(request: MessageRequest):
         }
         session["messages"].append(assistant_msg)
         
-        # ==================== CRISIS DETECTION (BACKGROUND) ====================
-        # Run crisis detection in background without blocking therapy response
-        async def run_crisis_detection_background():
+        # ==================== SYNCHRONOUS CRISIS DETECTION (FAST) ====================
+        # Run ELECTRA synchronously (fast) to determine if we need to alert the frontend
+        crisis_alert = False
+        crisis_probability = None
+        crisis_reason = None
+        electra_result = None
+
+        if suicide_detector.is_available():
+            try:
+                electra_result = suicide_detector.predict(request.content, session_id=request.session_id)
+                suicide_detector.print_result(electra_result, session_id=request.session_id)
+                crisis_probability = electra_result.get("probabilities", {}).get("suicidal")
+                if crisis_probability is not None and crisis_probability >= 0.85:
+                    crisis_alert = True
+                    crisis_reason = electra_result.get("alert_reason") or f"ELECTRA suicidal probability {crisis_probability:.2%}"
+            except Exception as e:
+                print(f"⚠️  Synchronous ELECTRA detection error: {str(e)}")
+
+        # ==================== CRISIS EMAIL ALERT (BACKGROUND) ====================
+        if crisis_alert and request.user_email:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    send_crisis_alert_email,
+                    request.user_email,
+                    user_name=None,
+                    session_id=request.session_id,
+                    message_preview=request.content,
+                )
+            )
+
+        # ==================== FULL CRISIS DETECTION (BACKGROUND) ====================
+        # Run LLM detection + moderate tracking in background without blocking response
+        async def run_crisis_detection_background(electra_result=electra_result):
             """Run crisis detection in background - fire and forget."""
             try:
-                # Run ELECTRA detection
-                if suicide_detector.is_available():
-                    electra_result = suicide_detector.predict(request.content, session_id=request.session_id)
-                    suicide_detector.print_result(electra_result, session_id=request.session_id)
-                else:
-                    electra_result = None
-                
                 # Run LLM detection
                 try:
                     llm_result = suicide_detector.predict_with_llm(request.content, session_id=request.session_id)
@@ -640,17 +668,20 @@ async def therapy_message(request: MessageRequest):
             except Exception as e:
                 print(f"❌ Background crisis detection error: {str(e)}")
         
-        # Start crisis detection as background task (fire and forget)
+        # Start full crisis detection as background task (fire and forget)
         asyncio.create_task(run_crisis_detection_background())
         
         # ==================== RETURN THERAPY RESPONSE IMMEDIATELY ====================
-        # Therapy response is returned without waiting for crisis detection
+        # Therapy response now includes synchronous crisis alert info
         return TherapyResponse(
             session_id=request.session_id,
             user_message=request.content,
             assistant_message=response_text,
             timestamp=assistant_msg["timestamp"],
-            facial_emotion=request.facial_emotion
+            facial_emotion=request.facial_emotion,
+            crisis_alert=crisis_alert,
+            crisis_probability=crisis_probability,
+            crisis_reason=crisis_reason
         )
     
     except Exception as e:
@@ -662,7 +693,8 @@ async def therapy_audio(
     session_id: str,
     file: UploadFile = File(...),
     facial_emotion: Optional[str] = Form(None),
-    tts: bool = Form(True)
+    tts: bool = Form(True),
+    user_email: Optional[str] = Form(None)
 ):
     """
     Process audio input and return therapy response.
@@ -768,18 +800,41 @@ async def therapy_audio(
         }
         session["messages"].append(assistant_msg)
         
-        # ==================== STEP 5B: CRISIS DETECTION (BACKGROUND) ====================
-        # Run crisis detection in background without blocking audio response
-        async def run_crisis_detection_background():
+        # ==================== STEP 5B: SYNCHRONOUS CRISIS DETECTION (FAST) ====================
+        # Run ELECTRA synchronously (fast) to determine if we need to alert the frontend
+        crisis_alert = False
+        crisis_probability = None
+        crisis_reason = None
+        electra_result = None
+
+        if suicide_detector.is_available():
+            try:
+                electra_result = suicide_detector.predict(user_text.strip(), session_id=session_id)
+                suicide_detector.print_result(electra_result, session_id=session_id)
+                crisis_probability = electra_result.get("probabilities", {}).get("suicidal")
+                if crisis_probability is not None and crisis_probability >= 0.85:
+                    crisis_alert = True
+                    crisis_reason = electra_result.get("alert_reason") or f"ELECTRA suicidal probability {crisis_probability:.2%}"
+            except Exception as e:
+                print(f"⚠️  Synchronous ELECTRA detection error: {str(e)}")
+
+        # ==================== CRISIS EMAIL ALERT (BACKGROUND) ====================
+        if crisis_alert and user_email:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    send_crisis_alert_email,
+                    user_email,
+                    user_name=None,
+                    session_id=session_id,
+                    message_preview=user_text.strip(),
+                )
+            )
+
+        # ==================== FULL CRISIS DETECTION (BACKGROUND) ====================
+        # Run LLM detection + moderate tracking in background without blocking response
+        async def run_crisis_detection_background(electra_result=electra_result):
             """Run crisis detection in background - fire and forget."""
             try:
-                # Run ELECTRA detection
-                if suicide_detector.is_available():
-                    electra_result = suicide_detector.predict(user_text.strip(), session_id=session_id)
-                    suicide_detector.print_result(electra_result, session_id=session_id)
-                else:
-                    electra_result = None
-                
                 # Run LLM detection
                 try:
                     llm_result = suicide_detector.predict_with_llm(user_text.strip(), session_id=session_id)
@@ -827,7 +882,7 @@ async def therapy_audio(
             except Exception as e:
                 print(f"❌ Background crisis detection error: {str(e)}")
         
-        # Start crisis detection as background task (fire and forget)
+        # Start full crisis detection as background task (fire and forget)
         asyncio.create_task(run_crisis_detection_background())
         
         # ==================== STEP 6: TTS (OPTIONAL) ====================
@@ -854,7 +909,10 @@ async def therapy_audio(
             "emotion": emotion_label,
             "audio_base64": audio_base64,
             "audio_type": "audio/wav" if audio_base64 else None,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "crisis_alert": crisis_alert,
+            "crisis_probability": crisis_probability,
+            "crisis_reason": crisis_reason,
         }
     
     except HTTPException:
