@@ -1,5 +1,5 @@
 """
-Hybrid retrieval: combines FAISS vector search with Knowledge-Graph reasoning.
+Hybrid retrieval: combines metadata-only FAISS chunk selection with Knowledge-Graph reasoning.
 
 Two public entry-points used by ui.py:
   • hybrid_classify  – enriches the classification step with KG symptom matching
@@ -69,10 +69,10 @@ def _safe_json_parse(text: str, model_cls):
 # ───────────────────── hybrid_classify ────────────────────────────────
 
 def hybrid_classify(summary_json: str) -> Optional[ClassificationModel]:
-    """Run classification with FAISS retrieval + KG symptom evidence.
+    """Run classification with metadata-only retrieval + KG symptom evidence.
 
     Steps:
-      1. FAISS overview retrieval (same as before).
+      1. Overview chunk retrieval by metadata label.
       2. KG symptom matching on patient symptom list.
       3. Inject KG evidence into the classifier prompt.
       4. Parse and return ClassificationModel.
@@ -80,7 +80,7 @@ def hybrid_classify(summary_json: str) -> Optional[ClassificationModel]:
     db = get_vectorstore()
     G = build_knowledge_graph()
 
-    # 1 — FAISS overview chunks
+    # 1 — Overview chunks selected by metadata label
     ref_docs = retrieve_overview_chunks(db, summary_json, k=10)
     ref_text = "\n\n---\n\n".join(
         f"**Category: {d.metadata.get('category', 'N/A')}**\n{d.page_content}"
@@ -194,7 +194,7 @@ def hybrid_diagnose(
     results = []
 
     for category in sorted_cats:
-        # FAISS retrieval for this category
+        # Category chunks selected by metadata label
         cat_docs = retrieve_category_chunks(db, summary_json, category, k=1000)
         cat_text = "\n\n---\n\n".join(d.page_content for d in cat_docs)
         if not cat_text.strip():
@@ -258,7 +258,7 @@ def hybrid_diagnose(
             disorder=category,
         )
 
-        # Retrieve comorbidity chunks from FAISS for detected disorders
+        # Retrieve comorbidity chunks by metadata for detected disorders
         comorbidity_text_parts = []
         for disorder in detected_disorder_names:
             comorb_docs = retrieve_comorbidity_chunks(db, disorder, k=5)
