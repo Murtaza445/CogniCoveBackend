@@ -1,4 +1,4 @@
-"""Vectorstore utilities for FAISS embedding and retrieval."""
+"""Vectorstore utilities for FAISS loading and metadata-only retrieval."""
 
 from functools import lru_cache
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -19,71 +19,88 @@ def get_vectorstore():
     return db
 
 
+def _iter_documents_in_deterministic_order(db):
+    """Yield stored documents in a stable order based on FAISS index order."""
+    docstore = getattr(db, "docstore", None)
+    docstore_dict = getattr(docstore, "_dict", {}) if docstore is not None else {}
+    index_to_docstore_id = getattr(db, "index_to_docstore_id", None)
+
+    if isinstance(index_to_docstore_id, dict) and index_to_docstore_id:
+        for index in sorted(index_to_docstore_id):
+            doc_id = index_to_docstore_id[index]
+            doc = docstore_dict.get(doc_id)
+            if doc is not None:
+                yield doc
+        return
+
+    for doc_id in sorted(docstore_dict):
+        doc = docstore_dict.get(doc_id)
+        if doc is not None:
+            yield doc
+
+
+def _filter_documents_by_metadata(db, *, required_metadata, k=None):
+    """Select documents whose metadata matches all required labels."""
+    matches = []
+    for doc in _iter_documents_in_deterministic_order(db):
+        metadata = getattr(doc, "metadata", {}) or {}
+        if all(metadata.get(key) == value for key, value in required_metadata.items()):
+            matches.append(doc)
+            if k is not None and len(matches) >= k:
+                break
+    return matches
+
+
 def retrieve_overview_chunks(db, query, k=10):
-    """Retrieve overview/criteria chunks for classification.
+    """Retrieve overview/criteria chunks by metadata only.
     
     Args:
         db: FAISS vectorstore
-        query: Search query text
-        k: Number of results to retrieve
+        query: Preserved for compatibility; not used for retrieval
+        k: Maximum number of matching results to return after filtering
     
     Returns:
-        List of retrieved documents
+        List of overview documents whose metadata.section matches the overview label
     """
-    try:
-        # Server-side filter by section
-        docs = db.similarity_search(query, k=k, filter={"section": "overview_summary_criteria"})
-    except TypeError:
-        # Fallback: client-side filter
-        docs = db.similarity_search(query, k=k*5)
-        docs = [d for d in docs if d.metadata.get("section") == "overview_summary_criteria"]
-    return docs
+    return _filter_documents_by_metadata(
+        db,
+        required_metadata={"section": "overview_summary_criteria"},
+        k=k,
+    )
 
 
 def retrieve_category_chunks(db, query, category, k=1000):
-    """Retrieve all chunks for a specific disorder category.
+    """Retrieve all chunks for a specific disorder category by metadata only.
     
     Args:
         db: FAISS vectorstore
-        query: Search query text
+        query: Preserved for compatibility; not used for retrieval
         category: Disorder category name
-        k: Maximum number of results to retrieve
+        k: Maximum number of matching results to return after filtering
     
     Returns:
-        List of retrieved documents filtered by category
+        List of documents whose metadata.category matches the requested category
     """
-    try:
-        # Server-side filter by category only
-        docs = db.similarity_search(query, k=k, filter={"category": category})
-    except TypeError:
-        # Fallback: client-side filter
-        all_docs = db.similarity_search(query, k=k)
-        docs = [d for d in all_docs if d.metadata.get("category") == category]
-    return docs
+    return _filter_documents_by_metadata(
+        db,
+        required_metadata={"category": category},
+        k=k,
+    )
 
 
 def retrieve_comorbidity_chunks(db, disorder_name, k=10):
-    """Retrieve comorbidity-specific chunks for a given disorder.
+    """Retrieve comorbidity-specific chunks for a given disorder by metadata only.
 
     Args:
         db: FAISS vectorstore
         disorder_name: Exact disorder name as stored in metadata
-        k: Number of results to retrieve
+        k: Maximum number of matching results to return after filtering
 
     Returns:
-        List of comorbidity documents for the disorder
+        List of comorbidity documents whose metadata.disorder and metadata.section match
     """
-    query = f"{disorder_name} comorbidity"
-    try:
-        docs = db.similarity_search(
-            query, k=k,
-            filter={"disorder": disorder_name, "section": "comorbidity"},
-        )
-    except TypeError:
-        all_docs = db.similarity_search(query, k=k * 5)
-        docs = [
-            d for d in all_docs
-            if d.metadata.get("disorder") == disorder_name
-            and d.metadata.get("section") == "comorbidity"
-        ]
-    return docs
+    return _filter_documents_by_metadata(
+        db,
+        required_metadata={"disorder": disorder_name, "section": "comorbidity"},
+        k=k,
+    )

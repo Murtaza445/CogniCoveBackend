@@ -39,3 +39,7 @@ frontfyp.py
 fix_imports.py
 build_disorder_vectorstores.py
 .venv-packages.txt
+
+# --- Tests ---
+test_*.py
+tests/
