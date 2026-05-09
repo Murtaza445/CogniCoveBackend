@@ -28,7 +28,7 @@ from realtime.ws_manager import WebSocketSessionManager
 from realtime.audio_pipeline import VoskStreamingSTT, PiperTTS
 from realtime.emotion_pipeline import analyze_speech, analyze_face
 from suicide_detection import get_suicide_detector
-from email_service import send_crisis_alert_email
+
 from deploy_validate import validate
 
 # Fail fast if model files are missing or are Git LFS pointers
@@ -584,48 +584,75 @@ async def therapy_message(request: MessageRequest):
         }
         session["messages"].append(assistant_msg)
         
-        # ==================== SYNCHRONOUS CRISIS DETECTION (FAST) ====================
-        # Run ELECTRA synchronously (fast) to determine if we need to alert the frontend
+        # ==================== SYNCHRONOUS CRISIS DETECTION (HYBRID) ====================
+        # ELECTRA >= 0.75 → immediate popup
+        # ELECTRA 0.50-0.75 → run LLM sync for verification (with 3s timeout)
+        # ELECTRA < 0.50 → no popup
         crisis_alert = False
         crisis_probability = None
         crisis_reason = None
         electra_result = None
+        llm_result_sync = None
 
         if suicide_detector.is_available():
             try:
-                electra_result = suicide_detector.predict(request.content, session_id=request.session_id)
+                electra_result = suicide_detector.predict(request.content, session_id=request.session_id, user_email=request.user_email, message_id=user_msg["timestamp"])
                 suicide_detector.print_result(electra_result, session_id=request.session_id)
-                crisis_probability = electra_result.get("probabilities", {}).get("suicidal")
-                if crisis_probability is not None and crisis_probability >= 0.85:
+                
+                # Path 1: ELECTRA high (>= 0.75) → immediate alert
+                if electra_result and electra_result.get('is_alert'):
                     crisis_alert = True
-                    crisis_reason = electra_result.get("alert_reason") or f"ELECTRA suicidal probability {crisis_probability:.2%}"
+                    crisis_reason = electra_result.get('alert_reason')
+                    crisis_probability = electra_result.get('suicidal_probability')
+                
+                # Path 2: ELECTRA borderline (0.50-0.75) → verify with LLM synchronously
+                elif electra_result and electra_result.get('suicidal_probability', 0.0) >= 0.50:
+                    try:
+                        llm_result_sync = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                suicide_detector.predict_with_llm,
+                                request.content,
+                                session_id=request.session_id,
+                                electra_result=electra_result,
+                                user_email=request.user_email,
+                                message_id=user_msg["timestamp"]
+                            ),
+                            timeout=7.0
+                        )
+                        suicide_detector.print_result(llm_result_sync, session_id=request.session_id)
+                        
+                        risk_level = str(llm_result_sync.get("risk_level", "")).strip().lower()
+                        has_intent = bool(llm_result_sync.get("has_suicide_intent", False))
+                        
+                        if has_intent or risk_level in ["high", "critical"]:
+                            crisis_alert = True
+                            crisis_reason = llm_result_sync.get("alert_reason") or f"LLM {risk_level.upper()} RISK DETECTED"
+                            crisis_probability = llm_result_sync.get("confidence", 0.0)
+                    except asyncio.TimeoutError:
+                        print(f"⚠️  LLM verification timed out for session {request.session_id} — defaulting to ALERT")
+                        crisis_alert = True
+                        crisis_reason = "ELECTRA borderline + LLM verification timeout (fail-safe alert)"
+                        crisis_probability = electra_result.get('suicidal_probability')
+                    except Exception as e:
+                        print(f"⚠️  LLM verification error: {str(e)}")
             except Exception as e:
                 print(f"⚠️  Synchronous ELECTRA detection error: {str(e)}")
 
-        # ==================== CRISIS EMAIL ALERT (BACKGROUND) ====================
-        if crisis_alert and request.user_email:
-            asyncio.create_task(
-                asyncio.to_thread(
-                    send_crisis_alert_email,
-                    request.user_email,
-                    user_name=None,
-                    session_id=request.session_id,
-                    message_preview=request.content,
-                )
-            )
-
-        # ==================== FULL CRISIS DETECTION (BACKGROUND) ====================
+        # ==================== BACKGROUND CRISIS DETECTION ====================
         # Run LLM detection + moderate tracking in background without blocking response
-        async def run_crisis_detection_background(electra_result=electra_result):
+        # Email alerts are now dispatched centrally from suicide_detection.py
+        async def run_crisis_detection_background(electra_result=electra_result, llm_result_sync=llm_result_sync):
             """Run crisis detection in background - fire and forget."""
             try:
-                # Run LLM detection
-                try:
-                    llm_result = suicide_detector.predict_with_llm(request.content, session_id=request.session_id)
-                    suicide_detector.print_result(llm_result, session_id=request.session_id)
-                except Exception as e:
-                    print(f"⚠️  LLM detection error: {str(e)}")
-                    llm_result = None
+                # Use sync LLM result if already computed; otherwise run in background
+                llm_result = llm_result_sync
+                if llm_result is None:
+                    try:
+                        llm_result = suicide_detector.predict_with_llm(request.content, session_id=request.session_id, electra_result=electra_result, user_email=request.user_email, message_id=user_msg["timestamp"])
+                        suicide_detector.print_result(llm_result, session_id=request.session_id)
+                    except Exception as e:
+                        print(f"⚠️  LLM detection error: {str(e)}")
+                        llm_result = None
 
                 # ==================== MODERATE TRACKING + FINAL RE-CHECK ====================
                 tracking_result = None
@@ -637,6 +664,8 @@ async def therapy_message(request: MessageRequest):
                         electra_result=electra_result,
                         llm_result=llm_result,
                         timestamp=user_msg["timestamp"],
+                        user_email=request.user_email,
+                        message_id=user_msg["timestamp"],
                     )
                     final_recheck_result = tracking_result.get("final_recheck") if tracking_result else None
 
@@ -669,7 +698,7 @@ async def therapy_message(request: MessageRequest):
                 print(f"❌ Background crisis detection error: {str(e)}")
         
         # Start full crisis detection as background task (fire and forget)
-        asyncio.create_task(run_crisis_detection_background())
+        asyncio.create_task(run_crisis_detection_background(electra_result=electra_result, llm_result_sync=llm_result_sync))
         
         # ==================== RETURN THERAPY RESPONSE IMMEDIATELY ====================
         # Therapy response now includes synchronous crisis alert info
@@ -800,48 +829,75 @@ async def therapy_audio(
         }
         session["messages"].append(assistant_msg)
         
-        # ==================== STEP 5B: SYNCHRONOUS CRISIS DETECTION (FAST) ====================
-        # Run ELECTRA synchronously (fast) to determine if we need to alert the frontend
+        # ==================== SYNCHRONOUS CRISIS DETECTION (HYBRID) ====================
+        # ELECTRA >= 0.75 → immediate popup
+        # ELECTRA 0.50-0.75 → run LLM sync for verification (with 3s timeout)
+        # ELECTRA < 0.50 → no popup
         crisis_alert = False
         crisis_probability = None
         crisis_reason = None
         electra_result = None
+        llm_result_sync = None
 
         if suicide_detector.is_available():
             try:
-                electra_result = suicide_detector.predict(user_text.strip(), session_id=session_id)
+                electra_result = suicide_detector.predict(user_text.strip(), session_id=session_id, user_email=user_email, message_id=user_msg["timestamp"])
                 suicide_detector.print_result(electra_result, session_id=session_id)
-                crisis_probability = electra_result.get("probabilities", {}).get("suicidal")
-                if crisis_probability is not None and crisis_probability >= 0.85:
+                
+                # Path 1: ELECTRA high (>= 0.75) → immediate alert
+                if electra_result and electra_result.get('is_alert'):
                     crisis_alert = True
-                    crisis_reason = electra_result.get("alert_reason") or f"ELECTRA suicidal probability {crisis_probability:.2%}"
+                    crisis_reason = electra_result.get('alert_reason')
+                    crisis_probability = electra_result.get('suicidal_probability')
+                
+                # Path 2: ELECTRA borderline (0.50-0.75) → verify with LLM synchronously
+                elif electra_result and electra_result.get('suicidal_probability', 0.0) >= 0.50:
+                    try:
+                        llm_result_sync = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                suicide_detector.predict_with_llm,
+                                user_text.strip(),
+                                session_id=session_id,
+                                electra_result=electra_result,
+                                user_email=user_email,
+                                message_id=user_msg["timestamp"]
+                            ),
+                            timeout=7.0
+                        )
+                        suicide_detector.print_result(llm_result_sync, session_id=session_id)
+                        
+                        risk_level = str(llm_result_sync.get("risk_level", "")).strip().lower()
+                        has_intent = bool(llm_result_sync.get("has_suicide_intent", False))
+                        
+                        if has_intent or risk_level in ["high", "critical"]:
+                            crisis_alert = True
+                            crisis_reason = llm_result_sync.get("alert_reason") or f"LLM {risk_level.upper()} RISK DETECTED"
+                            crisis_probability = llm_result_sync.get("confidence", 0.0)
+                    except asyncio.TimeoutError:
+                        print(f"⚠️  LLM verification timed out for session {session_id} — defaulting to ALERT")
+                        crisis_alert = True
+                        crisis_reason = "ELECTRA borderline + LLM verification timeout (fail-safe alert)"
+                        crisis_probability = electra_result.get('suicidal_probability')
+                    except Exception as e:
+                        print(f"⚠️  LLM verification error: {str(e)}")
             except Exception as e:
                 print(f"⚠️  Synchronous ELECTRA detection error: {str(e)}")
 
-        # ==================== CRISIS EMAIL ALERT (BACKGROUND) ====================
-        if crisis_alert and user_email:
-            asyncio.create_task(
-                asyncio.to_thread(
-                    send_crisis_alert_email,
-                    user_email,
-                    user_name=None,
-                    session_id=session_id,
-                    message_preview=user_text.strip(),
-                )
-            )
-
-        # ==================== FULL CRISIS DETECTION (BACKGROUND) ====================
+        # ==================== BACKGROUND CRISIS DETECTION ====================
         # Run LLM detection + moderate tracking in background without blocking response
-        async def run_crisis_detection_background(electra_result=electra_result):
+        # Email alerts are now dispatched centrally from suicide_detection.py
+        async def run_crisis_detection_background(electra_result=electra_result, llm_result_sync=llm_result_sync):
             """Run crisis detection in background - fire and forget."""
             try:
-                # Run LLM detection
-                try:
-                    llm_result = suicide_detector.predict_with_llm(user_text.strip(), session_id=session_id)
-                    suicide_detector.print_result(llm_result, session_id=session_id)
-                except Exception as e:
-                    print(f"⚠️  LLM detection error: {str(e)}")
-                    llm_result = None
+                # Use sync LLM result if already computed; otherwise run in background
+                llm_result = llm_result_sync
+                if llm_result is None:
+                    try:
+                        llm_result = suicide_detector.predict_with_llm(user_text.strip(), session_id=session_id, electra_result=electra_result, user_email=user_email, message_id=user_msg["timestamp"])
+                        suicide_detector.print_result(llm_result, session_id=session_id)
+                    except Exception as e:
+                        print(f"⚠️  LLM detection error: {str(e)}")
+                        llm_result = None
 
                 # ==================== MODERATE TRACKING + FINAL RE-CHECK ====================
                 tracking_result = None
@@ -853,6 +909,8 @@ async def therapy_audio(
                         electra_result=electra_result,
                         llm_result=llm_result,
                         timestamp=user_msg["timestamp"],
+                        user_email=user_email,
+                        message_id=user_msg["timestamp"],
                     )
                     final_recheck_result = tracking_result.get("final_recheck") if tracking_result else None
 
@@ -883,7 +941,7 @@ async def therapy_audio(
                 print(f"❌ Background crisis detection error: {str(e)}")
         
         # Start full crisis detection as background task (fire and forget)
-        asyncio.create_task(run_crisis_detection_background())
+        asyncio.create_task(run_crisis_detection_background(electra_result=electra_result, llm_result_sync=llm_result_sync))
         
         # ==================== STEP 6: TTS (OPTIONAL) ====================
         audio_base64 = None
