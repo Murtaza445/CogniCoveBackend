@@ -18,12 +18,13 @@ DISORDER_CATEGORIES = [
     "Obsessive-Compulsive and Related Disorders",
 ]
 
-# LLM Configuration
-LLM_MODEL_NAME = "openai/gpt-oss-120b"
-THERAPY_MODEL_NAME = os.getenv("THERAPY_MODEL_NAME", "openai/gpt-oss-120b")
-CATEGORY_CLASSIFICATION_MODEL_NAME = os.getenv("CATEGORY_CLASSIFICATION_MODEL_NAME", "openai/gpt-oss-20b")
-DISORDER_DIAGNOSIS_MODEL_NAME = os.getenv("DISORDER_DIAGNOSIS_MODEL_NAME", "openai/gpt-oss-120b")
-CRISIS_DETECTION_LLM_MODEL_NAME = os.getenv("CRISIS_DETECTION_LLM_MODEL_NAME", "groq/compound")
+# LLM Configuration — Groq models optimized per task
+# Available Groq models: llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768, gemma2-9b-it
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama-3.3-70b-versatile")                           # Summary generation (high quality, run once)
+THERAPY_MODEL_NAME = os.getenv("THERAPY_MODEL_NAME", "llama-3.3-70b-versatile")                   # Therapy conversation (main user-facing)
+CATEGORY_CLASSIFICATION_MODEL_NAME = os.getenv("CATEGORY_CLASSIFICATION_MODEL_NAME", "mixtral-8x7b-32768")  # Structured JSON classification
+DISORDER_DIAGNOSIS_MODEL_NAME = os.getenv("DISORDER_DIAGNOSIS_MODEL_NAME", "llama-3.3-70b-versatile")      # Clinical diagnosis (critical accuracy)
+CRISIS_DETECTION_LLM_MODEL_NAME = os.getenv("CRISIS_DETECTION_LLM_MODEL_NAME", "llama-3.1-8b-instant")   # Fast background detection (runs every message)
 THERAPY_TEMPERATURE = 0.7
 DETERMINISTIC_TEMPERATURE = 0.0
 

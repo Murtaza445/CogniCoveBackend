@@ -4,6 +4,7 @@ import torch
 from transformers import ElectraForSequenceClassification, ElectraTokenizer
 from sklearn.preprocessing import LabelEncoder
 import os
+import threading
 from typing import Dict, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
@@ -43,6 +44,11 @@ class SuicideDetector:
         self.session_last_recheck_count = defaultdict(int)  # {session_id: last_count_rechecked}
         self.MODERATE_RISK_ALERT_COUNT = 5
         self.MODERATE_BUFFER_MAX = 10
+        
+        # Centralized crisis alert threshold and deduplication
+        self.ELECTRA_HIGH_ALERT_THRESHOLD = 0.75
+        self.ELECTRA_LLM_VERIFY_THRESHOLD = 0.50
+        self.session_sent_alert_keys = defaultdict(set)
         
         self._initialize_model(model_path)
     
@@ -105,13 +111,89 @@ class SuicideDetector:
         """Check if model is available."""
         return self.model is not None
     
-    def predict(self, text: str, session_id: str = None) -> Dict:
+    def _is_electra_high(self, electra_result: Optional[Dict]) -> bool:
+        """Check if ELECTRA result indicates high risk."""
+        if not electra_result:
+            return False
+        prob = float(electra_result.get("suicidal_probability", 0.0))
+        return prob >= self.ELECTRA_HIGH_ALERT_THRESHOLD
+
+    def _is_llm_high(self, llm_result: Optional[Dict]) -> bool:
+        """Check if LLM result indicates high risk."""
+        if not llm_result:
+            return False
+        risk_level = str(llm_result.get("risk_level", "")).strip().lower()
+        has_intent = bool(llm_result.get("has_suicide_intent", False))
+        return has_intent or risk_level in ["high", "critical"]
+
+    def _combine_alert_decision(self, electra_result: Optional[Dict], llm_result: Optional[Dict]) -> Tuple[bool, str, float]:
+        """Combined arbiter: returns (is_alert, reason, probability)."""
+        e_high = self._is_electra_high(electra_result)
+        l_high = self._is_llm_high(llm_result)
+
+        if e_high and l_high:
+            prob = max(
+                electra_result.get("suicidal_probability", 0.0),
+                llm_result.get("confidence", 0.0)
+            )
+            return True, "ELECTRA + LLM HIGH RISK DETECTED", prob
+        elif e_high:
+            prob = electra_result.get("suicidal_probability", 0.0)
+            reason = electra_result.get("alert_reason") or f"ELECTRA suicidal probability {prob:.2%}"
+            return True, reason, prob
+        elif l_high:
+            prob = llm_result.get("confidence", 0.0)
+            reason = llm_result.get("alert_reason") or f"LLM {llm_result.get('risk_level', 'HIGH').upper()} RISK DETECTED"
+            return True, reason, prob
+        return False, "", 0.0
+
+    def _build_alert_key(self, session_id: str, message_id: str, alert_type: str = "message_high") -> str:
+        """Build deduplication key for alert."""
+        return f"{session_id}:{alert_type}:{message_id}"
+
+    def _mark_alert_sent(self, session_id: str, key: str) -> bool:
+        """Check if alert should be sent (deduplication). Returns True if first time."""
+        if key in self.session_sent_alert_keys[session_id]:
+            return False
+        self.session_sent_alert_keys[session_id].add(key)
+        return True
+
+    def dispatch_crisis_alert(self, session_id: str, message_id: str, user_email: Optional[str], user_name: Optional[str], message_preview: str, alert_type: str = "message_high", reason: str = "") -> bool:
+        """Centralized dispatch with dedup. Returns True if email was sent."""
+        if not user_email:
+            return False
+
+        key = self._build_alert_key(session_id, message_id, alert_type)
+        if not self._mark_alert_sent(session_id, key):
+            print(f"⚠️  Crisis alert already dispatched for {key} — skipping duplicate")
+            return False
+
+        try:
+            # Lazy import to avoid circular dependencies
+            from email_service import send_crisis_alert_email
+            # Run email in background thread to avoid blocking
+            t = threading.Thread(
+                target=send_crisis_alert_email,
+                args=(user_email, user_name, session_id, message_preview),
+                daemon=True
+            )
+            t.start()
+            print(f"✅ Crisis alert email dispatched for {key}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to dispatch crisis alert for {key}: {str(e)}")
+            return False
+    
+    def predict(self, text: str, session_id: str = None, user_email: str = None, user_name: str = None, message_id: str = None) -> Dict:
         """
         Predict if text contains suicidal intent.
         
         Args:
             text: Input text to analyze
             session_id: Session ID for tracking multiple messages
+            user_email: User email for crisis alert
+            user_name: User name for crisis alert
+            message_id: Message identifier for deduplication
             
         Returns:
             Dict with prediction, confidence, and probabilities
@@ -153,10 +235,15 @@ class SuicideDetector:
             non_suicide_prob = probs[0][0].item()
             suicide_prob = probs[0][1].item()
             
-            # Track low-confidence messages (kept for ELECTRA-only heuristic)
+            # Immediate high-probability alert (centralized popup + email trigger)
             is_alert = False
             alert_reason = None
-            if session_id is not None:
+            if suicide_prob >= self.ELECTRA_HIGH_ALERT_THRESHOLD:
+                is_alert = True
+                alert_reason = f"ELECTRA suicidal probability {suicide_prob:.2%}"
+            
+            # Track low-confidence messages (legacy heuristic, only if not already high)
+            if session_id is not None and not is_alert:
                 if non_suicide_prob < self.LOW_CONFIDENCE_THRESHOLD:
                     self.session_low_confidence_tracker[session_id].append(non_suicide_prob)
                     
@@ -164,7 +251,7 @@ class SuicideDetector:
                         is_alert = True
                         alert_reason = f"MULTIPLE LOW CONFIDENCE MESSAGES ({self.LOW_CONFIDENCE_ALERT_COUNT} messages with <{self.LOW_CONFIDENCE_THRESHOLD} confidence)"
             
-            return {
+            result = {
                 'text': text[:100] + ('...' if len(text) > 100 else ''),
                 'prediction': class_name,
                 'confidence': confidence,
@@ -177,6 +264,12 @@ class SuicideDetector:
                 'alert_reason': alert_reason,
                 'low_confidence_count': len(self.session_low_confidence_tracker.get(session_id, []))
             }
+            
+            # Dispatch email for high-probability alert (deduplicated)
+            if is_alert and alert_reason and "ELECTRA suicidal probability" in alert_reason and message_id:
+                self.dispatch_crisis_alert(session_id, message_id, user_email, user_name, text[:200], "message_high", alert_reason)
+            
+            return result
         
         except Exception as e:
             print(f"❌ Error in suicide detection: {str(e)}")
@@ -189,13 +282,17 @@ class SuicideDetector:
                 'alert_reason': f'Prediction error: {str(e)}'
             }
     
-    def predict_with_llm(self, text: str, session_id: str = None) -> Dict:
+    def predict_with_llm(self, text: str, session_id: str = None, electra_result: Optional[Dict] = None, user_email: str = None, user_name: str = None, message_id: str = None) -> Dict:
         """
         Detect suicidal intent using LLM analysis.
         
         Args:
             text: Input text to analyze
             session_id: Session ID for tracking
+            electra_result: ELECTRA result for combined decision
+            user_email: User email for crisis alert
+            user_name: User name for crisis alert
+            message_id: Message identifier for deduplication
             
         Returns:
             Dict with LLM prediction, reasoning, and alert status
@@ -258,7 +355,7 @@ RESPOND ONLY with a JSON object (no other text):
                 else:
                     alert_reason = f"LLM: {risk_level.upper()} RISK DETECTED"
             
-            return {
+            result = {
                 'text': text[:100] + ('...' if len(text) > 100 else ''),
                 'model': 'LLM',
                 'has_suicide_intent': has_intent,
@@ -270,6 +367,14 @@ RESPOND ONLY with a JSON object (no other text):
                 'is_alert': is_alert,
                 'alert_reason': alert_reason
             }
+            
+            # Combined decision: use both ELECTRA + LLM for centralized alert
+            combined_alert, combined_reason, combined_prob = self._combine_alert_decision(electra_result, result)
+            if combined_alert and message_id:
+                # Deduplicated dispatch: if ELECTRA already sent email for this message, LLM will not resend
+                self.dispatch_crisis_alert(session_id, message_id, user_email, user_name, text[:200], "message_high", combined_reason)
+            
+            return result
         
         except Exception as e:
             print(f"❌ Error in LLM suicide detection: {str(e)}")
@@ -309,6 +414,9 @@ RESPOND ONLY with a JSON object (no other text):
         electra_result: Optional[Dict],
         llm_result: Optional[Dict],
         timestamp: Optional[str] = None,
+        user_email: str = None,
+        user_name: str = None,
+        message_id: str = None,
     ) -> Dict:
         """Update moderate-only buffer + counter and run final re-check at threshold.
 
@@ -360,6 +468,9 @@ RESPOND ONLY with a JSON object (no other text):
             if final_recheck and final_recheck.get("is_alert"):
                 is_alert = True
                 alert_reason = final_recheck.get("alert_reason") or "FINAL RECHECK: HIGH RISK"
+                # Dispatch escalation email for final recheck (separate dedup key from message-level alerts)
+                if message_id:
+                    self.dispatch_crisis_alert(session_id, message_id, user_email, user_name, text[:200], "final_recheck", alert_reason)
             else:
                 alert_reason = f"CUMULATIVE MODERATE COUNT HIT {moderate_count}/{self.MODERATE_RISK_ALERT_COUNT} (final re-check did not escalate)"
         elif did_increment:
@@ -521,6 +632,8 @@ RESPOND ONLY with a JSON object (no other text):
             del self.session_moderate_risk_messages[session_id]
         if session_id in self.session_last_recheck_count:
             del self.session_last_recheck_count[session_id]
+        if session_id in self.session_sent_alert_keys:
+            del self.session_sent_alert_keys[session_id]
 
 
 # Global singleton instance
